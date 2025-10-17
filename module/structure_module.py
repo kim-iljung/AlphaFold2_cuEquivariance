@@ -1,19 +1,19 @@
 import torch
 
-from openfold.utils.rigid_utils import Rotation, Rigid
+from module.rigid_utils import Rotation, Rigid
 
-from openfold.np.residue_constants import (
+from module.residue_constants import (
     restype_rigid_group_default_frame,
     restype_atom14_to_rigid_group,
     restype_atom14_mask,
     restype_atom14_rigid_group_positions,
 )
-from openfold.utils.feats import (
+from module.feats import (
     frames_and_literature_positions_to_atom14_pos,
     torsion_angles_to_frames,
 )
 
-from openfold.utils.tensor_utils import dict_multimap
+from module.tensor_utils import dict_multimap
 
 class BackboneUpdate(torch.nn.Module):
     def __init__(self, c):
