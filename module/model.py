@@ -1,6 +1,4 @@
 import torch
-import time
-from torch.utils.checkpoint import checkpoint
 import gc
 # import GPUtil
 # import matplotlib.pyplot as plt
@@ -197,10 +195,11 @@ class Alphafold2(torch.nn.Module):
         #     batch["target_feat"], batch["residue_index"], batch["msa_feat"]
         m, z = self.input_embedder(batch["target_feat"], batch["residue_index"], batch["msa_feat"])
         
-        if torch.is_grad_enabled():
-            m_, z_ = checkpoint(self.recycling_embedder, prev_m, prev_z, self.pseudo_beta_fn(batch["aatype"], prev_x)) #
-        else:
-            m_, z_ = self.recycling_embedder(prev_m, prev_z, self.pseudo_beta_fn(batch["aatype"], prev_x)) #
+        m_, z_ = self.recycling_embedder(
+            prev_m,
+            prev_z,
+            self.pseudo_beta_fn(batch["aatype"], prev_x),
+        )
         m[..., 0, :, :] = m[..., 0, :, :] + m_
         z = z + z_
         if not torch.is_grad_enabled():
@@ -211,10 +210,7 @@ class Alphafold2(torch.nn.Module):
 
         template_batch = {k: v for k, v in batch.items() if k.startswith("template_")}
         
-        if torch.is_grad_enabled():
-            t, a = checkpoint(self.embed_templates, template_batch, z, pair_mask, no_batch_dims)
-        else:
-            t, a = self.embed_templates(template_batch, z, pair_mask, no_batch_dims)
+        t, a = self.embed_templates(template_batch, z, pair_mask, no_batch_dims)
         z = z + t
         m = torch.cat([m, a], dim=-3)
         if not torch.is_grad_enabled():
@@ -226,21 +222,16 @@ class Alphafold2(torch.nn.Module):
 
         extra_msa_feat = build_extra_msa_feat(batch).to(dtype=z.dtype)
         # print(extra_msa_feat.dtype)
-        if torch.is_grad_enabled():
-            a = checkpoint(self.extra_msa_embedder, extra_msa_feat)
-            z = self.extra_msa_stack(a, z, batch["extra_msa_mask"], pair_mask)
-        else:
-            a = self.extra_msa_embedder(extra_msa_feat)
-            z = self.extra_msa_stack(a, z, batch["extra_msa_mask"], pair_mask)
+        a = self.extra_msa_embedder(extra_msa_feat)
+        z = self.extra_msa_stack(a, z, batch["extra_msa_mask"], pair_mask)
+        if not torch.is_grad_enabled():
             del a
 
         # okay..
 
         # print("starting evoformer...")
-        if torch.is_grad_enabled():
-            m, z, s = self.evoformer(m, z, msa_mask, pair_mask)
-        else:
-            m, z, s = self.evoformer(m, z, msa_mask, pair_mask)
+        m, z, s = self.evoformer(m, z, msa_mask, pair_mask)
+        if not torch.is_grad_enabled():
             del m, z, s
         # print("evoformer done.")
 

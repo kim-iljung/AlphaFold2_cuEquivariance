@@ -1,102 +1,63 @@
 import torch
-import time
-import math
-import opt_einsum as oe
 
-from torch.utils.checkpoint import checkpoint
 from cuequivariance_torch import triangle_attention
-from module.chunked_attention import _attention_chunked_trainable, permute_final_dims
+
 
 class Linear(torch.nn.Linear):
-    """Linear layer wrapper that preserves precision for bfloat16 inputs.
+    """Linear layer wrapper that preserves precision for bfloat16 inputs."""
 
-    Accepts tensors of shape ``(..., in_dim)`` and returns
-    ``(..., out_dim)`` while ensuring the computation is executed in full
-    precision on bfloat16 activations.
-    """
-
-    def __init__(self, in_dim, out_dim, bias=True,init="default"):
-        super(Linear, self).__init__(in_dim, out_dim, bias=bias)
+    def __init__(self, in_dim, out_dim, bias=True, init="default"):
+        super().__init__(in_dim, out_dim, bias=bias)
 
         if bias:
             with torch.no_grad():
                 self.bias.fill_(0)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        d = input.dtype
-        if d is torch.bfloat16:
+        if input.dtype is torch.bfloat16:
             with torch.cuda.amp.autocast(enabled=False):
-                bias = self.bias.to(dtype=d) if self.bias is not None else None
-                return torch.nn.functional.linear(input, self.weight.to(dtype=d), bias)
+                bias = self.bias.to(dtype=input.dtype) if self.bias is not None else None
+                return torch.nn.functional.linear(input, self.weight.to(dtype=input.dtype), bias)
 
         return torch.nn.functional.linear(input, self.weight, self.bias)
 
 
 class LayerNorm(torch.nn.Module):
-    """LayerNorm that keeps numerics stable for bfloat16 activations.
+    """LayerNorm that keeps numerics stable for bfloat16 activations."""
 
-    Expects input with trailing dimension ``c_in`` and returns a tensor with
-    identical shape after applying affine normalization.
-    """
+    def __init__(self, c_in: int, eps: float = 1e-5):
+        super().__init__()
 
-    def __init__(self, c_in, eps=1e-5):
-        super(LayerNorm, self).__init__()
-        
         self.c_in = (c_in,)
         self.eps = eps
 
         self.weight = torch.nn.Parameter(torch.ones(c_in))
         self.bias = torch.nn.Parameter(torch.zeros(c_in))
 
-    def forward(self, x): 
-        d = x.dtype
-        if d is torch.bfloat16:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype is torch.bfloat16:
             with torch.cuda.amp.autocast(enabled=False):
-                out = torch.nn.functional.layer_norm(
-                    x, 
-                    self.c_in, 
-                    self.weight.to(dtype=d), 
-                    self.bias.to(dtype=d), 
-                    self.eps
+                return torch.nn.functional.layer_norm(
+                    x,
+                    self.c_in,
+                    self.weight.to(dtype=x.dtype),
+                    self.bias.to(dtype=x.dtype),
+                    self.eps,
                 )
-        else:
-            out = torch.nn.functional.layer_norm(
-                x,
-                self.c_in,
-                self.weight,
-                self.bias,
-                self.eps,
-            )
 
-        return out
-
-def softmax_no_cast(t, dim=-1):
-    d = t.dtype
-    if d is torch.bfloat16:
-        with torch.cuda.amp.autocast(enabled=False):
-            s = torch.nn.functional.softmax(t, dim=dim)
-    else:
-        s = torch.nn.functional.softmax(t, dim=dim)
-
-    return s
+        return torch.nn.functional.layer_norm(
+            x,
+            self.c_in,
+            self.weight,
+            self.bias,
+            self.eps,
+        )
 
 
 class MSARowAttentionWithPairBias(torch.nn.Module):
-    """Row-wise gated MSA attention with pair bias.
+    """Row-wise gated MSA attention with pair bias."""
 
-    Args:
-        c_m: MSA embedding channel dimension.
-        c_z: Pair embedding channel dimension.
-        c_h: Per-head channel dimension.
-        n_head: Number of attention heads.
-
-    The module consumes an MSA representation ``m`` of shape ``(B, s, i, c)``
-    (or ``(s, i, c)`` without batching), a pair embedding ``z`` with shape
-    ``(B, i, j, c)`` and an optional mask ``msa_mask`` shaped ``(B, s, i)``. The
-    returned tensor matches the leading dimensions of ``m``.
-    """
-
-    def __init__(self, c_m=256, c_z=128, c_h=4, n_head=8):
+    def __init__(self, c_m: int = 256, c_z: int = 128, c_h: int = 4, n_head: int = 8):
         super().__init__()
 
         self.c_m = c_m
@@ -115,7 +76,7 @@ class MSARowAttentionWithPairBias(torch.nn.Module):
 
         self.sigmoid = torch.nn.Sigmoid()
 
-    def forward(self, m, z, msa_mask=None):
+    def forward(self, m: torch.Tensor, z: torch.Tensor, msa_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Apply row-wise pair-biased attention to an MSA embedding."""
         is_batched = m.dim() == 4
         if not is_batched:
@@ -151,7 +112,9 @@ class MSARowAttentionWithPairBias(torch.nn.Module):
             attn_mask = mask_2d.bool()
 
         o = triangle_attention(
-            q, k, v,
+            q,
+            k,
+            v,
             bias=b,
             mask=attn_mask,
         )
@@ -167,210 +130,87 @@ class MSARowAttentionWithPairBias(torch.nn.Module):
 
         return o
 
-class MSARowAttentionWithPairBias_ckpt(torch.nn.Module):
-    """Checkpointed variant of row-wise pair-biased MSA attention.
 
-    Shares the same input and output contracts as
-    :class:`MSARowAttentionWithPairBias` but uses activation checkpointing to
-    reduce memory usage during training.
-    """
-    def __init__(self, c_m=256, c_z=128, c_h=4, n_head=8):
+class MSAColumnGlobalAttention(torch.nn.Module):
+    """Column-wise global MSA attention accelerated by the fused kernel."""
+
+    def __init__(self, c: int = 8, c_h: int = 1, n_head: int = 8):
         super().__init__()
 
-        self.c_m = c_m
-        self.c_z = c_z
+        self.c = c
         self.c_h = c_h
         self.n_head = n_head
 
-        self.layer_norm = LayerNorm(c_m)
-        self.layer_norm_b = LayerNorm(c_z)
-        self.proj_q = Linear(c_m, c_h * n_head, bias=False)
-        self.proj_k = Linear(c_m, c_h * n_head, bias=False)
-        self.proj_v = Linear(c_m, c_h * n_head, bias=False)
-        self.proj_b = Linear(c_z, n_head, bias=False)
-        self.proj_g = Linear(c_m, c_h * n_head)
-        self.proj_o = Linear(c_h * n_head, c_m)
-
+        self.layer_norm = LayerNorm(c)
+        self.proj_q = Linear(c, c_h * n_head, bias=False)
+        self.proj_k = Linear(c, c_h, bias=False)
+        self.proj_v = Linear(c, c_h, bias=False)
+        self.proj_g = Linear(c, c_h * n_head)
+        self.proj_o = Linear(c_h * n_head, c)
         self.sigmoid = torch.nn.Sigmoid()
 
-    def get_qkv(self, m, z):
-        m = self.layer_norm(m)
+    def forward(self, m: torch.Tensor, msa_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Apply column-wise gated attention to an MSA embedding."""
+        is_batched = m.dim() == 4
+        if not is_batched:
+            m = m.unsqueeze(0)
+            if msa_mask is not None:
+                msa_mask = msa_mask.unsqueeze(0)
 
-        q, k, v = self.proj_q(m), self.proj_k(m), self.proj_v(m)
-        gate = self.sigmoid(self.proj_g(m))
-        b = self.proj_b(self.layer_norm_b(z)) # (B, i, j, h)
-
-        q_shape = q.shape[:-1]
-        h, c_h = self.n_head, self.c_h
-
-        q = q.reshape(*q_shape, h, c_h) # (B, s, i, h, c)
-        k = k.reshape(*q_shape, h, c_h)
-        v = v.reshape(*q_shape, h, c_h)
-
-        q = q.transpose(-2, -3)
-        k = k.transpose(-2, -3)
-        v = v.transpose(-2, -3)    
-        q = q / math.sqrt(c_h)
-
-        b = permute_final_dims(b, (2, 0, 1)).unsqueeze(-4)
-
-        gate = gate.reshape(*q_shape, h, c_h)
-
-        return q, k, v, b, gate
-
-
-    def get_a(self, q, k, b, msa_mask):
-        h, c_h = self.n_head, self.c_h
-        a = oe.contract("... s i h c, ... s j h c -> ... s i j h", q, k) / (c_h**0.5) # (B, s, i, j, h)
-        if msa_mask != None:
-            a = a + (1e9 * (msa_mask-1))[..., :, None, :, None]
-        a = a + b
-        
-        return a
-    
-    def get_sm(self, a):
-        return softmax_no_cast(a, dim=-2)
-
-    def get_o(self, a, v, gate):
-        h, c_h = self.n_head, self.c_h
-        o = gate * oe.contract("... s i j h, ... s j h c -> ... s i h c", a, v) # (B, s, i, h, c)
-        o = o.reshape(*o.shape[:-2], h * c_h) # (B, s, i, h * c)
-        o = self.proj_o(o)
-
-        return o
-    
-    def wrap(self, o, gate):
-        h, c_h = self.n_head, self.c_h
-        o = gate * o
-        o = o.reshape(*o.shape[:-2], h * c_h)
-        o = self.proj_o(o)
-        return o
-
-
-    def forward(self, m, z, msa_mask=None):
-        """
-        Algorithm 7: MSA row-wise gated self-attention with pair bias
-
-        m: (B, s, i, c)
-        z: (B, i, j, c)
-        msa_mask: (B, s, i)
-
-        return: (B, s, i, c)
-        """
-
-        if torch.is_grad_enabled():
-            q, k, v, b, gate = checkpoint(self.get_qkv, m, z)
-        else:
-            q, k, v, b, gate = self.get_qkv(m, z)
-
-        if msa_mask == None:
-            msa_mask = m.new_ones(m.shape[:-1])
-        
-        if torch.is_grad_enabled():
-            o = _attention_chunked_trainable(
-                    query=q, 
-                    key=k, 
-                    value=v, 
-                    biases=[(1e9 * (msa_mask-1))[..., :, None, :, None], b], 
-                    chunk_size=4, 
-                    chunk_dim=-4,
-                    checkpoint_flag=True,
-                )
-        else:
-            o = _attention_chunked_trainable(
-                    query=q, 
-                    key=k, 
-                    value=v, 
-                    biases=[(1e9 * (msa_mask-1))[..., :, None, :, None], b], 
-                    chunk_size=4, 
-                    chunk_dim=-4,
-                    checkpoint_flag=False,
-                )
-        
-        if torch.is_grad_enabled():
-            o = checkpoint(self.wrap, o, gate)
-        else:
-            o = self.wrap(o, gate)
-            del q, k, v, b, gate
-
-        return o # (B, s, i, c)
-
-
-
-    def get_qkv(self, m, mask):
-        m = self.layer_norm(m)
-        q = torch.sum(m * mask.unsqueeze(-1), dim=-2) / (
-            torch.sum(mask, dim=-1)[..., None] + 1e-5
-        )
-
-        q, k, v = self.proj_q(q), self.proj_k(m), self.proj_v(m)
-        g = self.sigmoid(self.proj_g(m))
-
-        h, c, c_h = self.n_head, self.c, self.c_h
-        q = q * (c_h ** (-0.5))
-
-        q_shape = q.shape[:-1]
-        q = q.view(*q_shape, h, c_h)
-        g = g.view(*g.shape[:-1], h, c_h)
-
-        bias = (1e9 * (mask - 1))[..., :, None, :]
-
-        return q, k, v, bias, g
-    
-    def attention(self, q, k, v, bias, g):
-        h, c, c_h = self.n_head, self.c, self.c_h
-        a = torch.matmul(q, k.transpose(-1, -2))
-        a = a + bias
-        a = softmax_no_cast(a, dim=-1)
-        o = torch.matmul(a, v)
-        o = o.unsqueeze(-3) * g
-        o = o.view(*o.shape[:-2], h*c_h)
-        o = self.proj_o(o)
-
-        return o
-
-
-    def forward(self, m, mask=None):
-        """
-        Algorithm 19: MSA global column-wise gated self-attention
-
-        m: (B, s, i, c)
-
-        return: (B, s, i, c)
-        """
-
-        if mask is None:
-            mask = torch.ones(m.shape[:-1], dtype=m.dtype, device=m.device).detach()
+        if msa_mask is None:
+            msa_mask = torch.ones(m.shape[:-1], dtype=m.dtype, device=m.device)
 
         m = m.transpose(-2, -3)
-        mask = mask.transpose(-1, -2)
+        msa_mask = msa_mask.transpose(-1, -2)
 
-        if torch.is_grad_enabled():
-            q, k, v, bias, g = checkpoint(self.get_qkv, m, mask)
-        else:
-            q, k, v, bias, g = self.get_qkv(m, mask)
-            tmps = (q, k, v, bias, g)
-            del q, k, v, bias, g
-        
-        if torch.is_grad_enabled():
-            o = checkpoint(self.attention, q, k, v, bias, g)
-        else:
-            o = self.attention(*tmps)
-            del tmps
-    
+        m_norm = self.layer_norm(m)
+
+        weights = msa_mask.unsqueeze(-1)
+        denom = torch.sum(msa_mask, dim=-1, keepdim=True) + 1e-5
+        q_global = torch.sum(m_norm * weights, dim=-2) / denom
+
+        q = self.proj_q(q_global)
+        k = self.proj_k(m_norm)
+        v = self.proj_v(m_norm)
+        gate = self.sigmoid(self.proj_g(m_norm))
+
+        B, i, s, _ = m.shape
+        h, c_h = self.n_head, self.c_h
+
+        q = q.view(B, i, h, c_h).unsqueeze(-2).repeat(1, 1, 1, s, 1)
+        k = k.unsqueeze(-3).repeat(1, 1, h, 1, 1)
+        v = v.unsqueeze(-3).repeat(1, 1, h, 1, 1)
+        gate = gate.view(B, i, s, h, c_h)
+
+        mask_keys = msa_mask.bool()
+        attn_mask = mask_keys.unsqueeze(-2) & mask_keys.unsqueeze(-1)
+        attn_mask = attn_mask.unsqueeze(2).expand(-1, -1, h, -1, -1)
+
+        q = q * mask_keys.unsqueeze(-1).unsqueeze(-1)
+
+        o = triangle_attention(
+            q,
+            k,
+            v,
+            mask=attn_mask,
+        )
+
+        o = o.permute(0, 1, 3, 2, 4)
+        o = o * gate * mask_keys.unsqueeze(-1).unsqueeze(-1)
+        o = o.reshape(B, i, s, h * c_h)
+        o = self.proj_o(o)
         o = o.transpose(-2, -3)
 
-        return o # (B, s, i, c)
+        if not is_batched:
+            o = o.squeeze(0)
+
+        return o
 
 
 class MSAColumnAttention(torch.nn.Module):
-    """Column-wise gated MSA attention implemented with the fused kernel.
+    """Column-wise gated MSA attention implemented with the fused kernel."""
 
-    Consumes an MSA embedding ``m`` with shape ``(B, s, i, c)`` (or without a
-    batch dimension) and an optional mask ``msa_mask`` shaped ``(B, s, i)``. The
-    output tensor matches the leading dimensions of ``m``.
-    """
-    def __init__(self, c=32, c_h=4, n_head=8):
+    def __init__(self, c: int = 32, c_h: int = 4, n_head: int = 8):
         super().__init__()
 
         self.c = c
@@ -379,15 +219,15 @@ class MSAColumnAttention(torch.nn.Module):
 
         self.layer_norm = LayerNorm(c)
 
-        self.proj_q = Linear(c, c_h* n_head, bias=False)
-        self.proj_k = Linear(c, c_h* n_head, bias=False)
-        self.proj_v = Linear(c, c_h* n_head, bias=False)
+        self.proj_q = Linear(c, c_h * n_head, bias=False)
+        self.proj_k = Linear(c, c_h * n_head, bias=False)
+        self.proj_v = Linear(c, c_h * n_head, bias=False)
         self.proj_g = Linear(c, c_h * n_head)
         self.proj_o = Linear(c_h * n_head, c)
 
         self.sigmoid = torch.nn.Sigmoid()
 
-    def forward(self, m, msa_mask=None):
+    def forward(self, m: torch.Tensor, msa_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Apply column-wise gated attention to an MSA embedding."""
         is_batched = m.dim() == 4
         if not is_batched:
@@ -423,12 +263,12 @@ class MSAColumnAttention(torch.nn.Module):
             mask_T = msa_mask.transpose(1, 2)
             mask_2d = mask_T.unsqueeze(-1) * mask_T.unsqueeze(-2)
             attn_mask = mask_2d.bool()
-
-        zero_bias = torch.zeros((B, i, s, s), device=q.device, dtype=q.dtype)
+            attn_mask = attn_mask.unsqueeze(2).expand(-1, -1, h, -1, -1)
 
         o = triangle_attention(
-            q, k, v,
-            bias=zero_bias,
+            q,
+            k,
+            v,
             mask=attn_mask,
         )
 
