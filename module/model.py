@@ -5,12 +5,12 @@ import gc
 # import GPUtil
 # import matplotlib.pyplot as plt
 
-from openfold.utils.rigid_utils import Rigid
+from module.rigid_utils import Rigid
 import module.residue_constants as rc
 
-from openfold.utils.feats import atom14_to_atom37, build_extra_msa_feat
+from module.feats import atom14_to_atom37, build_extra_msa_feat
 
-from openfold.utils.tensor_utils import tensor_tree_map
+from module.tensor_utils import tensor_tree_map
 
 from module.embedder import InputEmbedder, RecyclingEmbedder, ExtraMSAEmbedder
 from module.template import TemplateAngleEmbedder, TemplatePairEmbedder, TemplatePairStack,TemplatePointwiseAttention
@@ -129,15 +129,6 @@ class Alphafold2(torch.nn.Module):
         act = act * template_mask_2d[..., None]
 
         return act
-    
-    def build_extra_msa_feat(batch):
-        msa_1hot = torch.nn.functional.one_hot(batch["extra_msa"], 23)
-        msa_feat = [
-            msa_1hot,
-            batch["extra_has_deletion"].unsqueeze(-1),
-            batch["extra_deletion_value"].unsqueeze(-1),
-        ]
-        return torch.cat(msa_feat, dim=-1)
     
     def embed_templates(self, batch, z, pair_mask, templ_dim):
         n_templ = batch["template_aatype"].shape[templ_dim]        
