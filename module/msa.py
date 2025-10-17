@@ -183,16 +183,23 @@ class MSAColumnGlobalAttention(torch.nn.Module):
         gate = gate.view(B, i, s, h, c_h)
 
         mask_keys = msa_mask.bool()
-        mask_values = msa_mask.to(dtype=q.dtype)
+        mask_values = mask_keys.to(dtype=q.dtype)
         attn_mask = mask_keys.unsqueeze(-2) & mask_keys.unsqueeze(-1)
         attn_mask = attn_mask.unsqueeze(2).expand(-1, -1, h, -1, -1)
 
-        q = q * mask_values.unsqueeze(2).unsqueeze(-1)
+        mask_broadcast = mask_values.unsqueeze(2).unsqueeze(-1)
+        q = q * mask_broadcast
+        k = k * mask_broadcast
+        v = v * mask_broadcast
+        gate = gate * mask_broadcast
+
+        bias = torch.zeros(B, 1, h, i, s, dtype=q.dtype, device=q.device)
 
         o = triangle_attention(
             q,
             k,
             v,
+            bias=bias,
             mask=attn_mask,
         )
 
