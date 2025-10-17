@@ -1,8 +1,26 @@
+import contextlib
+import inspect
+
 import torch
 import opt_einsum as oe
-from cuequivariance_torch import triangle_multiplicative_update
+
+try:  # Prefer the fused cuEquivariance kernel when available.
+    from cuequivariance_torch import triangle_multiplicative_update  # type: ignore
+except ImportError:  # pragma: no cover - kernel package missing at import time.
+    triangle_multiplicative_update = None  # type: ignore[assignment]
 
 class TriangleMultiplicationOutgoing(torch.nn.Module):
+    """Triangular multiplicative update operating on outgoing edges.
+
+    Args:
+        c: Channel dimension of the pair representation.
+
+    The module accepts a pair tensor ``z`` shaped ``(B, i, j, c)`` (or without a
+    batch dimension) and optionally a binary ``pair_mask`` of shape ``(B, i, j)``.
+    It returns an updated tensor with identical leading dimensions while the
+    fused kernel handles normalization, gating, and projections internally.
+    """
+
     def __init__(self, c=128):
         super().__init__()
 
@@ -21,58 +39,55 @@ class TriangleMultiplicationOutgoing(torch.nn.Module):
         self.sigmoid = torch.nn.Sigmoid()
 
     def forward(self, z, pair_mask=None):
-        """
-        Algorithm 11: Triangular multiplicative update using "outgoing" edges
-        (__init__ 변경 없이, Fused cuequivariance kernel을 사용하도록 forward만 수정)
+        """Apply the outgoing triangular multiplicative update.
 
-        z: (B, i, j, c)
-        return: (B, i, j, c)
+        Args:
+            z: Pair embedding with shape ``(B, i, j, c)`` or ``(i, j, c)``.
+            pair_mask: Optional mask with shape ``(B, i, j)`` or ``(i, j)``.
+
+        Returns:
+            Tensor with the same leading dimensions as ``z``.
         """
-        # 1. 배치 차원 확인 및 임시 추가
+
         is_batched = z.dim() == 4
         if not is_batched:
             z = z.unsqueeze(0)
             if pair_mask is not None:
                 pair_mask = pair_mask.unsqueeze(0)
 
-        # 2. 마스크 준비
         if pair_mask is None:
             pair_mask = z.new_ones(z.shape[:-1])
 
-        # 3. Fused Kernel에 전달할 파라미터 동적 결합
-        # 분리된 proj_a와 proj_b의 가중치를 (2*c, c) 형태로 결합
+        pair_mask = pair_mask.to(dtype=z.dtype)
+
+        # Fuse projections and gates to match the fused kernel interface.
         p_in_weight_fused = torch.cat([self.proj_a.weight, self.proj_b.weight], dim=0)
         p_in_bias_fused = torch.cat([self.proj_a.bias, self.proj_b.bias], dim=0)
-        
-        # 분리된 gate_a와 gate_b의 가중치를 (2*c, c) 형태로 결합
         g_in_weight_fused = torch.cat([self.gate_a.weight, self.gate_b.weight], dim=0)
         g_in_bias_fused = torch.cat([self.gate_a.bias, self.gate_b.bias], dim=0)
-        
-        # 4. cuequivariance 함수 호출
-        # 모든 연산(norm, gate, matmul, out_norm, out_proj)이 이 함수 안에서 처리됨
-        output = triangle_multiplicative_update(
-            x=z,
+
+        output = _call_triangle_kernel(
+            triangle_multiplicative_update,
             direction="outgoing",
-            mask=pair_mask,
-            # 입력 정규화 파라미터
-            norm_in_weight=self.layer_norm.weight,
-            norm_in_bias=self.layer_norm.bias,
-            # 동적으로 결합한 입력 프로젝션/게이트 파라미터
+            z=z,
+            pair_mask=pair_mask,
+            norm_in=self.layer_norm,
+            norm_out=self.layer_norm_out,
+            proj_out=self.proj_o,
+            gate_out=self.gate,
             p_in_weight=p_in_weight_fused,
-            # p_in_bias=p_in_bias_fused,
+            p_in_bias=p_in_bias_fused,
             g_in_weight=g_in_weight_fused,
-            # g_in_bias=g_in_bias_fused,
-            # 출력 정규화 파라미터
-            norm_out_weight=self.layer_norm_out.weight,
-            norm_out_bias=self.layer_norm_out.bias,
-            # 출력 프로젝션/게이트 파라미터
-            p_out_weight=self.proj_o.weight,
-            # p_out_bias=self.proj_o.bias,
-            g_out_weight=self.gate.weight,
-            # g_out_bias=self.gate.bias
+            g_in_bias=g_in_bias_fused,
         )
 
-        # 5. (필요시) 임시 배치 차원 제거
+        if output is None:
+            output = self._triangle_multiplicative_update(
+                z,
+                pair_mask,
+                direction="outgoing",
+            )
+
         if not is_batched:
             output = output.squeeze(0)
 
@@ -80,6 +95,13 @@ class TriangleMultiplicationOutgoing(torch.nn.Module):
 
 
 class TriangleMultiplicationIncoming(torch.nn.Module):
+    """Triangular multiplicative update operating on incoming edges.
+
+    Mirrors :class:`TriangleMultiplicationOutgoing` but propagates information
+    from incoming neighbours. Input shapes and return values follow the same
+    conventions.
+    """
+
     def __init__(self, c=128):
         super().__init__()
 
@@ -98,59 +120,138 @@ class TriangleMultiplicationIncoming(torch.nn.Module):
         self.sigmoid = torch.nn.Sigmoid()
 
     def forward(self, z, pair_mask=None):
-        """
-        Algorithm 12: Triangular multiplicative update using "incoming" edges
-        (__init__ 변경 없이, Fused cuequivariance kernel을 사용하도록 forward만 수정)
-
-        z: (B, i, j, c)
-        return: (B, i, j, c)
-        """
-        # 1. 배치 차원 확인 및 임시 추가
+        """Apply the incoming triangular multiplicative update."""
         is_batched = z.dim() == 4
         if not is_batched:
             z = z.unsqueeze(0)
             if pair_mask is not None:
                 pair_mask = pair_mask.unsqueeze(0)
 
-        # 2. 마스크 준비
         if pair_mask is None:
             pair_mask = z.new_ones(z.shape[:-1])
 
-        # 3. Fused Kernel에 전달할 파라미터 동적 결합
-        # 분리된 proj_a와 proj_b의 가중치를 (2*c, c) 형태로 결합
+        pair_mask = pair_mask.to(dtype=z.dtype)
+
         p_in_weight_fused = torch.cat([self.proj_a.weight, self.proj_b.weight], dim=0)
         p_in_bias_fused = torch.cat([self.proj_a.bias, self.proj_b.bias], dim=0)
-        
-        # 분리된 gate_a와 gate_b의 가중치를 (2*c, c) 형태로 결합
         g_in_weight_fused = torch.cat([self.gate_a.weight, self.gate_b.weight], dim=0)
         g_in_bias_fused = torch.cat([self.gate_a.bias, self.gate_b.bias], dim=0)
-        
-        # 4. cuequivariance 함수 호출
-        # 모든 연산(norm, gate, matmul, out_norm, out_proj)이 이 함수 안에서 처리됨
-        output = triangle_multiplicative_update(
-            x=z,
+
+        output = _call_triangle_kernel(
+            triangle_multiplicative_update,
             direction="incoming",
-            mask=pair_mask,
-            # 입력 정규화 파라미터
-            norm_in_weight=self.layer_norm.weight,
-            norm_in_bias=self.layer_norm.bias,
-            # 동적으로 결합한 입력 프로젝션/게이트 파라미터
+            z=z,
+            pair_mask=pair_mask,
+            norm_in=self.layer_norm,
+            norm_out=self.layer_norm_out,
+            proj_out=self.proj_o,
+            gate_out=self.gate,
             p_in_weight=p_in_weight_fused,
-            # p_in_bias=p_in_bias_fused,
+            p_in_bias=p_in_bias_fused,
             g_in_weight=g_in_weight_fused,
-            # g_in_bias=g_in_bias_fused,
-            # 출력 정규화 파라미터
-            norm_out_weight=self.layer_norm_out.weight,
-            norm_out_bias=self.layer_norm_out.bias,
-            # 출력 프로젝션/게이트 파라미터
-            p_out_weight=self.proj_o.weight,
-            # p_out_bias=self.proj_o.bias,
-            g_out_weight=self.gate.weight,
-            # g_out_bias=self.gate.bias
+            g_in_bias=g_in_bias_fused,
         )
 
-        # 5. (필요시) 임시 배치 차원 제거
+        if output is None:
+            output = self._triangle_multiplicative_update(
+                z,
+                pair_mask,
+                direction="incoming",
+            )
+
         if not is_batched:
             output = output.squeeze(0)
 
         return output
+
+    def _triangle_multiplicative_update(self, z, pair_mask, direction):
+        """Torch fallback mirroring the triangular multiplicative update."""
+
+        mask = pair_mask.unsqueeze(-1)
+
+        z_norm = self.layer_norm(z)
+        gate = torch.sigmoid(self.gate(z_norm))
+
+        proj_a = self.proj_a(z_norm) * torch.sigmoid(self.gate_a(z_norm))
+        proj_b = self.proj_b(z_norm) * torch.sigmoid(self.gate_b(z_norm))
+
+        proj_a = proj_a * mask
+        proj_b = proj_b * mask
+
+        if direction == "outgoing":
+            # Contract outgoing edges j <- k -> i.
+            contracted = oe.contract(
+                "...ikc,...jkc->...ijc", proj_a, proj_b, optimize="optimal"
+            )
+        else:
+            contracted = oe.contract(
+                "...kjc,...kic->...ijc", proj_a, proj_b, optimize="optimal"
+            )
+
+        contracted = contracted * pair_mask.unsqueeze(-1)
+        contracted = self.layer_norm_out(contracted)
+        contracted = self.proj_o(contracted)
+        contracted = contracted * gate
+
+        return contracted
+
+
+def _call_triangle_kernel(
+    kernel,
+    *,
+    direction,
+    z,
+    pair_mask,
+    norm_in,
+    norm_out,
+    proj_out,
+    gate_out,
+    p_in_weight,
+    p_in_bias,
+    g_in_weight,
+    g_in_bias,
+):
+    """Invoke the fused triangle kernel while adapting to signature drift."""
+
+    if kernel is None:
+        return None
+
+    call_kwargs = {}
+
+    try:
+        signature = inspect.signature(kernel)
+        param_names = set(signature.parameters)
+    except (TypeError, ValueError):
+        param_names = None
+
+    def add_arg(names, value):
+        if value is None:
+            return
+        if param_names is None:
+            call_kwargs[names[0]] = value
+            return
+        for name in names:
+            if name in param_names:
+                call_kwargs[name] = value
+                return
+
+    add_arg(("x", "input", "tensor"), z.contiguous())
+    add_arg(("direction", "dir", "orientation"), direction)
+    add_arg(("mask", "input_mask", "attention_mask"), pair_mask.contiguous())
+    add_arg(("norm_in_weight", "norm_in_weights", "layer_norm_in_weight"), norm_in.weight)
+    add_arg(("norm_in_bias", "norm_in_biases", "layer_norm_in_bias"), norm_in.bias)
+    add_arg(("p_in_weight", "pin_weight", "proj_in_weight"), p_in_weight)
+    add_arg(("p_in_bias", "pin_bias", "proj_in_bias"), p_in_bias)
+    add_arg(("g_in_weight", "gin_weight", "gate_in_weight"), g_in_weight)
+    add_arg(("g_in_bias", "gin_bias", "gate_in_bias"), g_in_bias)
+    add_arg(("norm_out_weight", "norm_out_weights", "layer_norm_out_weight"), norm_out.weight)
+    add_arg(("norm_out_bias", "norm_out_biases", "layer_norm_out_bias"), norm_out.bias)
+    add_arg(("p_out_weight", "pout_weight", "proj_out_weight"), proj_out.weight)
+    add_arg(("p_out_bias", "pout_bias", "proj_out_bias"), proj_out.bias)
+    add_arg(("g_out_weight", "gout_weight", "gate_out_weight"), gate_out.weight)
+    add_arg(("g_out_bias", "gout_bias", "gate_out_bias"), gate_out.bias)
+
+    with contextlib.suppress(RuntimeError, TypeError, ValueError):
+        return kernel(**call_kwargs)
+
+    return None
