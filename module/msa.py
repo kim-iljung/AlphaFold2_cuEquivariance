@@ -254,33 +254,43 @@ class MSAColumnAttention(torch.nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+        gate = gate.transpose(1, 2)
 
         q = q.permute(0, 1, 3, 2, 4)
         k = k.permute(0, 1, 3, 2, 4)
         v = v.permute(0, 1, 3, 2, 4)
+        gate = gate.permute(0, 1, 3, 2, 4)
 
+        mask_values = torch.ones((B, i, s), dtype=q.dtype, device=m.device)
         attn_mask = None
         if msa_mask is not None:
-            mask_T = msa_mask.transpose(1, 2)
-            mask_2d = mask_T.unsqueeze(-1) * mask_T.unsqueeze(-2)
-            attn_mask = mask_2d.bool()
+            mask_keys = msa_mask.transpose(1, 2).bool()
+            mask_values = mask_keys.to(dtype=q.dtype)
+            attn_mask = mask_keys.unsqueeze(-2) & mask_keys.unsqueeze(-1)
             attn_mask = attn_mask.unsqueeze(2).expand(-1, -1, h, -1, -1)
+
+        q = q * mask_values.unsqueeze(2).unsqueeze(-1)
+        k = k * mask_values.unsqueeze(2).unsqueeze(-1)
+        v = v * mask_values.unsqueeze(2).unsqueeze(-1)
+        gate = gate * mask_values.unsqueeze(2).unsqueeze(-1)
+
+        bias = torch.zeros(B, 1, h, i, s, dtype=q.dtype, device=q.device)
 
         o = triangle_attention(
             q,
             k,
             v,
+            bias=bias,
             mask=attn_mask,
         )
 
-        o = o.permute(0, 1, 3, 2, 4)
-        o = o.transpose(1, 2)
-
-        o = o.reshape(B, s, i, h * c_h)
-        gate = gate.reshape(B, s, i, h * c_h)
-
         o = o * gate
+        o = o * mask_values.unsqueeze(2).unsqueeze(-1)
+
+        o = o.permute(0, 1, 3, 2, 4)
+        o = o.reshape(B, i, s, h * c_h)
         o = self.proj_o(o)
+        o = o.transpose(1, 2)
 
         if not is_batched:
             o = o.squeeze(0)
