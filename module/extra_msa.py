@@ -1,15 +1,11 @@
 import torch
-import time
-import opt_einsum as oe
 
 from module.util import DropoutRowwise, DropoutColumnwise
-from module.msa import MSAColumnGlobalAttention_ckpt, MSARowAttentionWithPairBias, MSARowAttentionWithPairBias_ckpt
+from module.msa import MSAColumnGlobalAttention, MSARowAttentionWithPairBias
 from module.transition import PairTransition, MSATransition
 from module.outer_product_mean import OuterProductMean
 from module.triangle_attention import TriangleAttentionStartingNode, TriangleAttentionEndingNode
 from module.triangle_multiplication import TriangleMultiplicationOutgoing, TriangleMultiplicationIncoming
-
-from torch.utils.checkpoint import checkpoint
 
 class ExtraMSAStackBlock(torch.nn.Module):
     def __init__(self, c_m=256, c_z=128, c_h_o=32, c_h_m=8, c_h_p=32, n=4, n_m=8, n_head=4, p_msa=0.15, p_pair=0.25):
@@ -31,8 +27,8 @@ class ExtraMSAStackBlock(torch.nn.Module):
         self.dropout_col = DropoutColumnwise(p_pair)
 
         # MSA stack
-        self.msa_row_attn = MSARowAttentionWithPairBias_ckpt(c_m, c_z, c_h_m, n_m)
-        self.msa_col_attn = MSAColumnGlobalAttention_ckpt(c_m, c_h_m, n_m)
+        self.msa_row_attn = MSARowAttentionWithPairBias(c_m, c_z, c_h_m, n_m)
+        self.msa_col_attn = MSAColumnGlobalAttention(c_m, c_h_m, n_m)
         self.msa_transition = MSATransition(c_m, n)
 
         # Communication
@@ -66,23 +62,13 @@ class ExtraMSAStackBlock(torch.nn.Module):
         # MSA Stack
         e = e + self.dropout_row_msa(self.msa_row_attn(e, z, msa_mask))
         e = e + self.msa_col_attn(e, msa_mask)
+        e = e + self.msa_transition(e, msa_mask)
 
-        if torch.is_grad_enabled():
-            e = e + checkpoint(self.msa_transition, e, msa_mask)
-        else:
-            e = e + self.msa_transition(e, msa_mask)
-        
-        if torch.is_grad_enabled():
-            z = z + checkpoint(self.outer_product_mean, e, msa_mask)
-        else:
-            z = z + self.outer_product_mean(e, msa_mask)
+        z = z + self.outer_product_mean(e, msa_mask)
 
         # Pair Stack
 
-        if torch.is_grad_enabled():
-            z = checkpoint(self.pair_stack_block, z, pair_mask)
-        else:
-            z = self.pair_stack_block(z, pair_mask)
+        z = self.pair_stack_block(z, pair_mask)
 
         return e, z
     
