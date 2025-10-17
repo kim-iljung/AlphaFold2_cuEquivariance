@@ -187,11 +187,13 @@ class MSAColumnGlobalAttention(torch.nn.Module):
         attn_mask = mask_keys.unsqueeze(-2) & mask_keys.unsqueeze(-1)
         attn_mask = attn_mask.unsqueeze(2).expand(-1, -1, h, -1, -1)
 
-        mask_broadcast = mask_values.unsqueeze(2).unsqueeze(-1)
-        q = q * mask_broadcast
-        k = k * mask_broadcast
-        v = v * mask_broadcast
-        gate = gate * mask_broadcast
+        qkv_mask = mask_values.unsqueeze(2).unsqueeze(-1)
+        gate_mask = mask_values.unsqueeze(-1).unsqueeze(-1)
+
+        q = q * qkv_mask
+        k = k * qkv_mask
+        v = v * qkv_mask
+        gate = gate * gate_mask
 
         bias = torch.zeros(B, 1, h, i, s, dtype=q.dtype, device=q.device)
 
@@ -204,7 +206,7 @@ class MSAColumnGlobalAttention(torch.nn.Module):
         )
 
         o = o.permute(0, 1, 3, 2, 4)
-        o = o * gate * mask_values.unsqueeze(-1).unsqueeze(-1)
+        o = o * gate * gate_mask
         o = o.reshape(B, i, s, h * c_h)
         o = self.proj_o(o)
         o = o.transpose(-2, -3)
