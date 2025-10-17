@@ -1,15 +1,11 @@
 import torch
 
-from tqdm import tqdm
-
 from module.msa import MSARowAttentionWithPairBias, MSAColumnAttention
 from module.util import DropoutRowwise, DropoutColumnwise
 from module.transition import MSATransition, PairTransition
 from module.outer_product_mean import OuterProductMean
 from module.triangle_attention import TriangleAttentionStartingNode, TriangleAttentionEndingNode
 from module.triangle_multiplication import TriangleMultiplicationOutgoing, TriangleMultiplicationIncoming
-
-from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 
 class EvoformerBlock(torch.nn.Module):
     def __init__(self, c_m=64, c_z=128, c_h_m=32, c_h_o=32, c_h_p=32, n_h_m=8, n_h_p=4, t_n=4, m_d=0.15, p_d=0.25, inf=1e9, eps=1e-10):
@@ -105,12 +101,9 @@ class Evoformer(torch.nn.Module):
         ]
         """
         # print(m.requires_grad, z.requires_grad, msa_mask.requires_grad, pair_mask.requires_grad)
-        if torch.is_grad_enabled():
-            m, z, msa_mask, pair_mask = checkpoint_sequential(self.blocks, len(self.blocks), (m, z, msa_mask, pair_mask))
-        else:
-            for block in self.blocks:
-                m, z, msa_mask, pair_mask = block((m, z, msa_mask, pair_mask))
-        
+        for block in self.blocks:
+            m, z, msa_mask, pair_mask = block((m, z, msa_mask, pair_mask))
+
         s = self.proj_o(m[..., 0, :, :])
 
         return m, z, s
