@@ -132,88 +132,102 @@ class MSARowAttentionWithPairBias(torch.nn.Module):
 
 
 class MSAColumnGlobalAttention(torch.nn.Module):
-    """Column-wise global MSA attention accelerated by the fused kernel."""
+    """
+    Algorithm 19: MSA global column-wise gated self-attention
+    m: (B, s, i, c)  -> return: (B, s, i, c)
 
-    def __init__(self, c: int = 8, c_h: int = 1, n_head: int = 8):
+    triangle_attention expects:
+        q:    (B, N, H, Q, D)
+        k/v:  (B, N, H, K, D)
+        bias: (B, 1, H, Q, K)  [여기선 0으로 둠]
+        mask: (B, N, 1, 1, K)  [bool]
+    여기서 N=i(열/position), Q=1(열당 글로벌 쿼리 1개), K=s(시퀀스 수).
+    """
+    def __init__(self, c=8, c_h=1, n_head=8):
         super().__init__()
 
         self.c = c
         self.c_h = c_h
         self.n_head = n_head
 
-        self.layer_norm = LayerNorm(c)
-        self.proj_q = Linear(c, c_h * n_head, bias=False)
-        self.proj_k = Linear(c, c_h, bias=False)
-        self.proj_v = Linear(c, c_h, bias=False)
-        self.proj_g = Linear(c, c_h * n_head)
-        self.proj_o = Linear(c_h * n_head, c)
+        self.layer_norm = torch.nn.LayerNorm(c)
+        self.proj_q = torch.nn.Linear(c, c_h * n_head, bias=False)
+        self.proj_k = torch.nn.Linear(c, c_h, bias=False)          # K/V는 head-공유
+        self.proj_v = torch.nn.Linear(c, c_h, bias=False)
+        self.proj_g = torch.nn.Linear(c, c_h * n_head)             # 게이팅
+        self.proj_o = torch.nn.Linear(c_h * n_head, c)
+
         self.sigmoid = torch.nn.Sigmoid()
 
-    def forward(self, m: torch.Tensor, msa_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """Apply column-wise gated attention to an MSA embedding."""
-        is_batched = m.dim() == 4
+    def forward(self, m, mask=None):
+        """
+        m:    (B, s, i, c)
+        mask: (B, s, i) in {0,1} or bool. 1/True=유효 토큰
+        """
+        is_batched = (m.dim() == 4)
         if not is_batched:
             m = m.unsqueeze(0)
-            if msa_mask is not None:
-                msa_mask = msa_mask.unsqueeze(0)
+            if mask is not None:
+                mask = mask.unsqueeze(0)
 
-        if msa_mask is None:
-            msa_mask = torch.ones(m.shape[:-1], dtype=m.dtype, device=m.device)
+        B, s, i, c = m.shape
 
-        m = m.transpose(-2, -3)
-        msa_mask = msa_mask.transpose(-1, -2)
+        # 기본 마스크
+        if mask is None:
+            mask = torch.ones((B, s, i), dtype=m.dtype, device=m.device)
 
-        m_norm = self.layer_norm(m)
+        # 열 우선으로 전치: (B, i, s, c), 마스크도 동일하게: (B, i, s)
+        m_col = m.transpose(-2, -3)
+        mask_col = mask.transpose(-1, -2)
 
-        weights = msa_mask.unsqueeze(-1)
-        denom = torch.sum(msa_mask, dim=-1, keepdim=True) + 1e-5
-        q_global = torch.sum(m_norm * weights, dim=-2) / denom
+        # 정규화
+        m_norm = self.layer_norm(m_col)
 
-        q = self.proj_q(q_global)
-        k = self.proj_k(m_norm)
-        v = self.proj_v(m_norm)
-        gate = self.sigmoid(self.proj_g(m_norm))
+        # (1) 열별 글로벌 쿼리: 시퀀스 축에 대한 masked mean  -> (B, i, c)
+        denom = mask_col.sum(dim=-1, keepdim=True).clamp_min(1e-5)    # 0-division 방지
+        q_global = (m_norm * mask_col.unsqueeze(-1)).sum(dim=-2) / denom
 
-        B, i, s, _ = m.shape
-        h, c_h = self.n_head, self.c_h
+        # (2) 투영
+        q = self.proj_q(q_global)                       # (B, i, H*C_h)
+        k = self.proj_k(m_norm)                         # (B, i, s, C_h)   <-- 헤드 공유
+        v = self.proj_v(m_norm)                         # (B, i, s, C_h)
+        g = self.sigmoid(self.proj_g(m_norm))           # (B, i, s, H*C_h)
 
-        q = q.view(B, i, h, c_h).unsqueeze(-2).repeat(1, 1, 1, s, 1)
-        k = k.unsqueeze(-3).repeat(1, 1, h, 1, 1)
-        v = v.unsqueeze(-3).repeat(1, 1, h, 1, 1)
-        gate = gate.view(B, i, s, h, c_h)
+        H, C_h = self.n_head, self.c_h
 
-        mask_keys = msa_mask.bool()
-        mask_values = mask_keys.to(dtype=q.dtype)
-        attn_mask = mask_keys.unsqueeze(-2) & mask_keys.unsqueeze(-1)
-        attn_mask = attn_mask.unsqueeze(2).expand(-1, -1, h, -1, -1)
+        # (3) triangle_attention 입력 형태로 변환
+        q = q.view(B, i, H, 1, C_h)                     # (B, N=i, H, Q=1, D=C_h)
 
-        qkv_mask = mask_values.unsqueeze(2).unsqueeze(-1)
-        gate_mask = mask_values.unsqueeze(-1).unsqueeze(-1)
+        # K/V를 head 차원으로 expand(메모리 복사 없이 stride-0 뷰)
+        k = k.unsqueeze(-3).expand(B, i, H, s, C_h)     # (B, N=i, H, K=s, D=C_h)
+        v = v.unsqueeze(-3).expand(B, i, H, s, C_h)
 
-        q = q * qkv_mask
-        k = k * qkv_mask
-        v = v * qkv_mask
-        gate = gate * gate_mask
+        # bias는 사용하지 않음(0). 커널은 내부에서 float32로 사용하므로 dtype=float32로 생성.
+        bias = torch.zeros((B, 1, H, 1, s), dtype=torch.float32, device=m.device)
 
-        bias = torch.zeros(B, 1, h, i, s, dtype=q.dtype, device=q.device)
+        # (4) 마스크: (B, N=i, 1, 1, K=s) 의 bool
+        attn_mask = mask_col.to(dtype=torch.bool).unsqueeze(-2).unsqueeze(-2)
 
+        # (5) TA 호출: scale=None -> 1/sqrt(D) 자동 적용
         o = triangle_attention(
-            q,
-            k,
-            v,
+            q=q, k=k, v=v,
             bias=bias,
             mask=attn_mask,
-        )
+            scale=None,
+            # return_aux=False (기본)
+        )                                                # (B, i, H, 1, C_h)
 
-        o = o.permute(0, 1, 3, 2, 4)
-        o = o * gate * gate_mask
-        o = o.reshape(B, i, s, h * c_h)
-        o = self.proj_o(o)
-        o = o.transpose(-2, -3)
+        # (6) 결과를 시퀀스 축으로 브로드캐스트한 뒤 게이팅
+        o = o.squeeze(-2).unsqueeze(-3)                 # (B, i, 1, H, C_h)
+        g = g.view(B, i, s, H, C_h)                     # (B, i, s, H, C_h)
+        o = (o * g).reshape(B, i, s, H * C_h)           # (B, i, s, H*C_h)
+
+        # (7) 출력 투영 및 원래 축 복구
+        o = self.proj_o(o)                              # (B, i, s, c)
+        o = o.transpose(-2, -3)                         # (B, s, i, c)
 
         if not is_batched:
             o = o.squeeze(0)
-
         return o
 
 

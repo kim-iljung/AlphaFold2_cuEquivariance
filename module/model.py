@@ -205,40 +205,23 @@ class Alphafold2(torch.nn.Module):
         if not torch.is_grad_enabled():
             del m_, z_, prev_m, prev_z, prev_x
 
-        # no prob..
-
 
         template_batch = {k: v for k, v in batch.items() if k.startswith("template_")}
-        
         t, a = self.embed_templates(template_batch, z, pair_mask, no_batch_dims)
         z = z + t
         m = torch.cat([m, a], dim=-3)
         if not torch.is_grad_enabled():
             del t, a
         msa_mask = torch.cat([batch["msa_mask"], batch["template_torsion_angles_mask"][..., 2]], dim=-2)
-
-        # maybe no prob!!
         
 
         extra_msa_feat = build_extra_msa_feat(batch).to(dtype=z.dtype)
-        # print(extra_msa_feat.dtype)
         a = self.extra_msa_embedder(extra_msa_feat)
         z = self.extra_msa_stack(a, z, batch["extra_msa_mask"], pair_mask)
         if not torch.is_grad_enabled():
             del a
 
-        # okay..
-
-        # print("starting evoformer...")
         m, z, s = self.evoformer(m, z, msa_mask, pair_mask)
-        if not torch.is_grad_enabled():
-            del m, z, s
-        # print("evoformer done.")
-
-        # no prob..
-
-        # for i in range(10):
-        #     plt.imsave(f"pair{i}.png", z[:,:,i].detach().cpu())
 
         outputs["msa_feat"] = m[..., :n_seq, :, :]
         outputs["pair"] = z
