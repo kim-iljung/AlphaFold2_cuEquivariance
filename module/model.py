@@ -1,7 +1,5 @@
 import torch
 import gc
-# import GPUtil
-# import matplotlib.pyplot as plt
 
 from module.rigid_utils import Rigid
 import module.residue_constants as rc
@@ -16,8 +14,8 @@ from module.evoformer import Evoformer
 from module.structure_module import StructureModule
 from module.heads import AuxiliaryHeads
 from module.extra_msa import ExtraMSAStack
-
 class Alphafold2(torch.nn.Module):
+    """End-to-end AlphaFold2 model adapted to leverage NVIDIA cuEquivariance."""
     def __init__(self, n_block=48, c=384, n_head=8, p=0.25, no_bins=64):
         super().__init__()
 
@@ -27,11 +25,11 @@ class Alphafold2(torch.nn.Module):
         self.p = p
         self.no_bins = no_bins
 
-        self.input_embedder = InputEmbedder(22,49) # 22 49 128 256
-        self.recycling_embedder = RecyclingEmbedder(128,256) # 128, 256
+        self.input_embedder = InputEmbedder(22, 49)
+        self.recycling_embedder = RecyclingEmbedder(128, 256)
 
-        self.template_angle_embedder = TemplateAngleEmbedder(57, 256) # 57, 256
-        self.template_pair_embedder = TemplatePairEmbedder(88, 64) # 88 64
+        self.template_angle_embedder = TemplateAngleEmbedder(57, 256)
+        self.template_pair_embedder = TemplatePairEmbedder(88, 64)
         self.template_pair_stack = TemplatePairStack(2, 64, 16, 2, 4, 0.25)
         self.template_pointwise_att = TemplatePointwiseAttention()
 
@@ -68,7 +66,6 @@ class Alphafold2(torch.nn.Module):
         template_mask = batch["template_pseudo_beta_mask"]
         template_mask_2d = template_mask[..., None] * template_mask[..., None, :]
 
-        # Compute distogram (this seems to differ slightly from Alg. 5)
         tpb = batch["template_pseudo_beta"]
         dgram = torch.sum(
             (tpb[..., None, :] - tpb[..., None, :, :]) ** 2, dim=-1, keepdim=True
@@ -170,16 +167,9 @@ class Alphafold2(torch.nn.Module):
         )
 
         return pseudo_beta
-
-    
-    # def atom14_to_atom37(atom14, batch):
-    
-    
-
     def iteration(self, batch, prev_m, prev_z, prev_x):
         outputs = {}
 
-        # default openfold input infomation
         batch_dims = batch["target_feat"].shape[:-2]
         no_batch_dims = len(batch_dims)
         n = batch["target_feat"].shape[-2]
@@ -190,11 +180,8 @@ class Alphafold2(torch.nn.Module):
         pair_mask = seq_mask[..., None] * seq_mask[..., None, :]
         msa_mask = batch["msa_mask"]
 
-        # input embedder
-        # if torch.is_grad_enabled():
-        #     batch["target_feat"], batch["residue_index"], batch["msa_feat"]
         m, z = self.input_embedder(batch["target_feat"], batch["residue_index"], batch["msa_feat"])
-        
+
         m_, z_ = self.recycling_embedder(
             prev_m,
             prev_z,
