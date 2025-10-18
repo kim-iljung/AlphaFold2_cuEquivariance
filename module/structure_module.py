@@ -149,6 +149,7 @@ class AngleResnet(torch.nn.Module):
 
 
 class StructureModule(torch.nn.Module):
+    """Predicts protein backbone and side-chain geometry from Evoformer embeddings."""
     def __init__(self, c_s=384, c_z=128, c_ipa=16, c_res=128, n_h_i=12, n_qk_points=4, n_v_points=8, p=0.1, n_blocks=8, n_transition_layers=1, n_resnet_blocks=2, n_angles=7,trans_scale_factor=10, eps=1e-12, inf=1e5):
         super().__init__()
 
