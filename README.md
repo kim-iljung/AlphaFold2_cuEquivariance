@@ -4,16 +4,17 @@ This repository provides an implementation of AlphaFold2 that integrates compone
 
 ## Key Features
 
-- **Evoformer Stack** – A faithful reproduction of the Evoformer architecture with attention, transition, and outer product blocks optimized for cuEquivariance-backed operations.
-- **Structure Module** – Predicts backbone and side-chain geometries, leveraging rigid transformations and torsion angle parameterizations.
-- **Template and Extra MSA Support** – Embedding pipelines for template features and extra MSA stacks mirror the original AlphaFold2 design while accelerating rigid transformations with cuEquivariance operators.
+- **cuEquivariance-accelerated MSA attention** – `MSARowAttentionWithPairBias.forward`, `MSAColumnAttention.forward`, and `MSAColumnGlobalAttention.forward` each dispatch the fused `triangle_attention` kernel for row, column, and global column mixing.
+- **Triangle pair attention kernels** – `TriangleAttentionStartingNode.forward` and `TriangleAttentionEndingNode.forward` call the `triangle_attention` operator to keep pair representations synchronized.
+- **Fused triangle multiplicative updates** – `TriangleMultiplicationOutgoing.forward` and `TriangleMultiplicationIncoming.forward` leverage `triangle_multiplicative_update` to accelerate outgoing and incoming pair updates.
 
 ## Repository Layout
 
-- `module/model.py` – Entry point that orchestrates embedding, Evoformer processing, structure prediction, and auxiliary heads.
-- `module/evoformer.py` – Contains the Evoformer stack implementation.
-- `module/structure_module.py` – Implements the structure module for geometric reconstruction.
-- `module/outer_product_mean.py` – Provides the outer product mean transformation used in pair updates.
+The following functions rely on cuEquivariance kernels to accelerate critical attention and pair-update steps:
+
+- `module/msa.py` – `MSARowAttentionWithPairBias.forward` dispatches the fused `triangle_attention` kernel for row-wise updates, `MSAColumnAttention.forward` leverages the same kernel for column-wise mixing, and `MSAColumnGlobalAttention.forward` shares the kernel for global column mixing.
+- `module/triangle_attention.py` – `TriangleAttentionStartingNode.forward` and `TriangleAttentionEndingNode.forward` invoke `triangle_attention` for pairwise attention.
+- `module/triangle_multiplication.py` – `TriangleMultiplicationOutgoing.forward` and `TriangleMultiplicationIncoming.forward` call `triangle_multiplicative_update` for fused pair updates.
 
 ## Getting Started
 
@@ -23,4 +24,4 @@ This repository provides an implementation of AlphaFold2 that integrates compone
 
 ## License
 
-Refer to the original project licenses for both AlphaFold2 and NVIDIA cuEquivariance when distributing derivative work.
+Refer to the original project licenses for AlphaFold2, NVIDIA cuEquivariance, and the openfold modules incorporated here when distributing derivative work.
